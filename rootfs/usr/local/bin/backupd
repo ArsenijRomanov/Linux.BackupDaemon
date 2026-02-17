@@ -112,12 +112,9 @@ set)
 		;;
 	esac
 
-	# существует ли ключ
 	if sudo grep -q "^$KEY=" $CONF; then
-		# обновить его значение
 		sudo sed -i "s|^$KEY=.*|$KEY=$VAL|" $CONF
 	else
-		# добавить в конец файла
 		echo "$KEY=$VAL" | sudo tee -a $CONF >/dev/null
 	fi
 
