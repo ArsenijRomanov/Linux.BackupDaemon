@@ -1,0 +1,13 @@
+[Unit]
+Description=Backup Daemon Service
+
+[Service]
+EnvironmentFile=/etc/default/backupd.conf
+Type=oneshot
+ExecStart=/usr/local/bin/backupd_daemon_exe "${SOURCE}" "${TARGET}"
+## Защита системных файлов
+User=ars
+Group=ars
+
+[Install]
+WantedBy=multi-user.target

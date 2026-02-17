@@ -1,0 +1,194 @@
+#!/bin/bash
+
+CONF="/etc/default/backupd.conf"
+
+die() {
+	echo "backupd: $*" >&2
+	exit 2
+}
+
+get_conf_value() {
+	sudo awk -F= -v k="$1" '$1==k {print substr($0,index($0,"=")+1); exit}' "$CONF" 2>/dev/null
+}
+
+canon_path() {
+	realpath -m -- "$1"
+}
+
+check_path_allowed() {
+	local role="$1"
+	local p
+	p="$(canon_path "$2")"
+
+	[[ "$p" != "/" ]] || die "$role must not be '/'"
+
+	for bad in /proc /sys /dev /run; do
+		[[ "$p" != "$bad" && "$p" != "$bad/"* ]] || die "$role must not be under '$bad': $p"
+	done
+}
+
+is_inside_or_equal() {
+	local parent="$1"
+	local child="$2"
+
+	[[ "$child" == "$parent" ]] && return 0
+	[[ "${child:0:${#parent}}" == "$parent" && "${child:${#parent}:1}" == "/" ]] && return 0
+	return 1
+}
+
+check_src_tgt_conflict() {
+	local src="$1"
+	local tgt="$2"
+
+	# conflict only when both are set
+	[[ -n "$src" && -n "$tgt" ]] || return 0
+
+	src="$(canon_path "$src")"
+	tgt="$(canon_path "$tgt")"
+
+	if [[ "$tgt" == "$src" ]]; then
+		die "conflict: source='$src' target='$tgt' (target must not be equal to source)"
+	fi
+
+	if is_inside_or_equal "$src" "$tgt"; then
+		die "conflict: source='$src' target='$tgt' (target must not be inside source)"
+	fi
+}
+
+case "$1" in
+
+set)
+	if [ $# -ne 3 ]; then
+		echo "Usage: backupd set source|target|frequency VALUE" >&2
+		exit 1
+	fi
+
+	key=$(echo "$2" | tr 'A-Z' 'a-z')
+	VAL="$3"
+
+	# allow only 3 keys
+	case "$key" in
+	source)
+		[[ "$VAL" = /* ]] || die "source must be an absolute path"
+		[[ -d "$VAL" ]] || die "source must exist and be a directory: $VAL"
+
+		check_path_allowed "source" "$VAL"
+
+		CUR_TARGET="$(get_conf_value TARGET)"
+		if [[ -n "$CUR_TARGET" ]]; then
+			check_src_tgt_conflict "$VAL" "$CUR_TARGET"
+		fi
+
+		KEY="SOURCE"
+		;;
+	target)
+		[[ "$VAL" = /* ]] || die "target must be an absolute path"
+		[[ ! -e "$VAL" || -d "$VAL" ]] || die "target exists but is not a directory: $VAL"
+
+		check_path_allowed "target" "$VAL"
+
+		CUR_SOURCE="$(get_conf_value SOURCE)"
+		if [[ -n "$CUR_SOURCE" ]]; then
+			check_src_tgt_conflict "$CUR_SOURCE" "$VAL"
+		fi
+
+		KEY="TARGET"
+		;;
+	frequency)
+		MIN_FREQUENCY="5s"
+
+		systemd-analyze timespan "$VAL" >/dev/null 2>&1 || die "invalid frequency format: $VAL"
+
+		val_us=$(systemd-analyze timespan "$VAL" 2>/dev/null | awk '/μs:/ {print $2; exit}')
+		min_us=$(systemd-analyze timespan "$MIN_FREQUENCY" 2>/dev/null | awk '/μs:/ {print $2; exit}')
+
+		[[ -n "$val_us" && -n "$min_us" ]] || die "cannot parse timespan"
+		[[ "$val_us" -ge "$min_us" ]] || die "frequency too small: $VAL (min: $MIN_FREQUENCY)"
+
+		KEY="FREQUENCY"
+		;;
+	*)
+		die "unknown key '$2' (allowed: source, target, frequency)"
+		;;
+	esac
+
+	# существует ли ключ
+	if sudo grep -q "^$KEY=" $CONF; then
+		# обновить его значение
+		sudo sed -i "s|^$KEY=.*|$KEY=$VAL|" $CONF
+	else
+		# добавить в конец файла
+		echo "$KEY=$VAL" | sudo tee -a $CONF >/dev/null
+	fi
+
+	if [ "$KEY" = "FREQUENCY" ]; then
+		sudo mkdir -p /etc/systemd/system/backupd.timer.d
+		echo -e "[Timer]\nOnActiveSec=\nOnUnitActiveSec=\nOnActiveSec=$VAL\nOnUnitActiveSec=$VAL" |
+			sudo tee /etc/systemd/system/backupd.timer.d/override.conf >/dev/null
+	fi
+
+	sudo systemctl daemon-reload
+	if systemctl is-active --quiet backupd.timer; then
+		sudo systemctl restart backupd.timer
+	fi
+	echo "backupd: set: '$KEY' = '$VAL'"
+	;;
+
+status)
+	systemctl status backupd.timer backupd.service --no-pager -n 0
+	cat $CONF
+	;;
+
+enable)
+	sudo systemctl enable --now backupd.timer >/dev/null && echo "backupd: enabled"
+	;;
+
+disable)
+	sudo systemctl disable --now backupd.timer >/dev/null && echo "backupd: disabled"
+	;;
+
+run)
+	sudo systemctl start backupd.service && echo "backupd: backup done"
+	;;
+
+log)
+	sudo journalctl -u backupd.timer -u backupd.service --since "1 hour ago"
+	;;
+
+help | -h | --help)
+	cat <<'EOF'
+usage: backupd <command> [<args>]
+
+Common commands:
+    status                Show timer/service status and print current config
+    enable                Enable and start the systemd timer
+    disable               Disable and stop the systemd timer
+    set source <path>     Set absolute source directory (must exist)
+    set target <path>     Set absolute target directory (created if missing)
+    set frequency <time>  Set backup interval
+    run                   Run one backup immediately
+    log                   Show recent logs (last hour)
+
+EOF
+	exit 0
+	;;
+
+"" | *)
+	cat <<'EOF'
+usage: backupd <command> [<args>]
+
+Common commands:
+    status                Show timer/service status and print current config
+    enable                Enable and start the systemd timer
+    disable               Disable and stop the systemd timer
+    set source <path>     Set absolute source directory (must exist)
+    set target <path>     Set absolute target directory (created if missing)
+    set frequency <time>  Set backup interval
+    run                   Run one backup immediately
+    log                   Show recent logs (last hour)
+
+EOF
+	exit 1
+	;;
+
+esac
